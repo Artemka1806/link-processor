@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import uvicorn
 import os
 from dotenv import load_dotenv
+import logging
 
 load_dotenv()
 
@@ -17,6 +18,8 @@ app = FastAPI(title="Link Processor")
 SECRET_KEY = os.getenv("SECRET_KEY", "default-key-please-change")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 
+# ---- NEW: список юзерів, які вже переходили ----
+visited_states = set()
 
 class LinkRequest(BaseModel):
     callback_url: HttpUrl
@@ -34,37 +37,27 @@ class LinkRequest(BaseModel):
 
 
 def get_base_url(request: Request) -> str:
-    """
-    Визначає BASE_URL з урахуванням проксі (Nginx, Cloudflare і т.д.).
-    Пріоритет:
-    1) X-Forwarded-Proto + X-Forwarded-Host
-    2) Host + scheme з самого запиту
-    """
     headers = request.headers
 
-    # 1. Через проксі (рекомендовано)
     forwarded_proto = headers.get("x-forwarded-proto")
     forwarded_host = headers.get("x-forwarded-host")
 
     if forwarded_proto and forwarded_host:
         return f"{forwarded_proto}://{forwarded_host}"
 
-    # 2. Якщо немає X-Forwarded-*, беремо звичайний host
     host = headers.get("host")
     if host:
-        # host може бути типу "example.com:8000"
         scheme = request.url.scheme
         return f"{scheme}://{host}"
 
-    # 3. Фолбек — використовуємо частини URL
     url = request.url
     if url.port:
         return f"{url.scheme}://{url.hostname}:{url.port}"
+
     return f"{url.scheme}://{url.hostname}"
 
 
 async def send_callback(callback_url: str, state: str):
-    """Send an HTTP POST request to the callback URL with the state."""
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
@@ -80,7 +73,6 @@ async def send_callback(callback_url: str, state: str):
 
 @app.post("/create-link", status_code=201)
 async def create_link(link_data: LinkRequest, request: Request):
-    """Create a link with the provided parameters."""
     base_url = get_base_url(request)
 
     payload = {
@@ -98,7 +90,9 @@ async def create_link(link_data: LinkRequest, request: Request):
 
 @app.get("/redirect/{token}")
 async def redirect(token: str, state: Optional[str] = None, background_tasks: BackgroundTasks = None):
-    """Handle the redirect and schedule the callback."""
+    if state is None:
+        raise HTTPException(status_code=400, detail="State is required")
+
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
 
@@ -108,6 +102,14 @@ async def redirect(token: str, state: Optional[str] = None, background_tasks: Ba
 
         if not all([callback_url, seconds, redirect_url]):
             raise HTTPException(status_code=400, detail="Invalid link parameters")
+
+        # ---- NEW: перевірка повторного переходу ----
+        if state in visited_states:
+            logging.info(f"User {state} already visited — no callback will be scheduled.")
+            return RedirectResponse(url=redirect_url)
+
+        # Якщо перший перехід
+        visited_states.add(state)
 
         background_tasks.add_task(
             schedule_callback,
@@ -125,7 +127,6 @@ async def redirect(token: str, state: Optional[str] = None, background_tasks: Ba
 
 
 async def schedule_callback(callback_url: str, state: str, delay: int):
-    """Schedule a callback after the specified delay."""
     await asyncio.sleep(delay)
     await send_callback(callback_url, state)
 
