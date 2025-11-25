@@ -1,11 +1,10 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, Depends
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, HttpUrl, validator
 import jwt
 from typing import Optional
 import httpx
 import asyncio
-import time
 from datetime import datetime, timedelta
 import uvicorn
 import os
@@ -17,14 +16,14 @@ app = FastAPI(title="Link Processor")
 
 SECRET_KEY = os.getenv("SECRET_KEY", "default-key-please-change")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+
 
 class LinkRequest(BaseModel):
     callback_url: HttpUrl
     seconds: int
     redirect_url: HttpUrl
     state: str
-    
+
     @validator('seconds')
     def validate_seconds(cls, v):
         if v <= 0:
@@ -32,6 +31,37 @@ class LinkRequest(BaseModel):
         if v > 3600:
             raise ValueError("Maximum delay is 3600 seconds (1 hour)")
         return v
+
+
+def get_base_url(request: Request) -> str:
+    """
+    Визначає BASE_URL з урахуванням проксі (Nginx, Cloudflare і т.д.).
+    Пріоритет:
+    1) X-Forwarded-Proto + X-Forwarded-Host
+    2) Host + scheme з самого запиту
+    """
+    headers = request.headers
+
+    # 1. Через проксі (рекомендовано)
+    forwarded_proto = headers.get("x-forwarded-proto")
+    forwarded_host = headers.get("x-forwarded-host")
+
+    if forwarded_proto and forwarded_host:
+        return f"{forwarded_proto}://{forwarded_host}"
+
+    # 2. Якщо немає X-Forwarded-*, беремо звичайний host
+    host = headers.get("host")
+    if host:
+        # host може бути типу "example.com:8000"
+        scheme = request.url.scheme
+        return f"{scheme}://{host}"
+
+    # 3. Фолбек — використовуємо частини URL
+    url = request.url
+    if url.port:
+        return f"{url.scheme}://{url.hostname}:{url.port}"
+    return f"{url.scheme}://{url.hostname}"
+
 
 async def send_callback(callback_url: str, state: str):
     """Send an HTTP POST request to the callback URL with the state."""
@@ -47,53 +77,58 @@ async def send_callback(callback_url: str, state: str):
             print(f"Error sending callback: {e}")
             return None
 
+
 @app.post("/create-link", status_code=201)
-async def create_link(link_data: LinkRequest):
+async def create_link(link_data: LinkRequest, request: Request):
     """Create a link with the provided parameters."""
+    base_url = get_base_url(request)
+
     payload = {
         "callback_url": str(link_data.callback_url),
         "seconds": link_data.seconds,
         "redirect_url": str(link_data.redirect_url),
         "exp": datetime.utcnow() + timedelta(days=30)
     }
-    
+
     token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-    
-    link = f"{BASE_URL}/redirect/{token}?state={link_data.state}"
-    
+    link = f"{base_url}/redirect/{token}?state={link_data.state}"
+
     return {"link": link}
+
 
 @app.get("/redirect/{token}")
 async def redirect(token: str, state: Optional[str] = None, background_tasks: BackgroundTasks = None):
     """Handle the redirect and schedule the callback."""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        
+
         callback_url = payload.get("callback_url")
         seconds = payload.get("seconds")
         redirect_url = payload.get("redirect_url")
-        
+
         if not all([callback_url, seconds, redirect_url]):
             raise HTTPException(status_code=400, detail="Invalid link parameters")
-        
+
         background_tasks.add_task(
-            schedule_callback, 
+            schedule_callback,
             callback_url=callback_url,
             state=state,
             delay=seconds
         )
-        
+
         return RedirectResponse(url=redirect_url)
-    
+
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=400, detail="Link has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=400, detail="Invalid link")
 
+
 async def schedule_callback(callback_url: str, state: str, delay: int):
     """Schedule a callback after the specified delay."""
     await asyncio.sleep(delay)
     await send_callback(callback_url, state)
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
