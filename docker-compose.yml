@@ -10,3 +10,10 @@ services:
     restart: unless-stopped
     environment:
       - TZ=UTC
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped

@@ -10,6 +10,8 @@ import uvicorn
 import os
 from dotenv import load_dotenv
 import logging
+import hashlib
+from redis.asyncio import Redis, from_url
 
 load_dotenv()
 
@@ -17,9 +19,27 @@ app = FastAPI(title="Link Processor")
 
 SECRET_KEY = os.getenv("SECRET_KEY", "default-key-please-change")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+VISITED_TTL_SECONDS = int(os.getenv("VISITED_TTL_SECONDS", str(30 * 24 * 60 * 60)))
 
-# ---- NEW: список юзерів, які вже переходили ----
-visited_states = set()
+redis_client: Optional[Redis] = None
+
+
+def visited_key(redirect_url: str) -> str:
+    digest = hashlib.sha256(redirect_url.encode("utf-8")).hexdigest()
+    return f"visited:{digest}"
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    global redis_client
+    redis_client = from_url(REDIS_URL, decode_responses=True)
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    if redis_client is not None:
+        await redis_client.close()
 
 class LinkRequest(BaseModel):
     callback_url: HttpUrl
@@ -103,13 +123,19 @@ async def redirect(token: str, state: Optional[str] = None, background_tasks: Ba
         if not all([callback_url, seconds, redirect_url]):
             raise HTTPException(status_code=400, detail="Invalid link parameters")
 
-        # ---- NEW: перевірка повторного переходу ----
-        if state in visited_states:
-            logging.info(f"User {state} already visited — no callback will be scheduled.")
+        if redis_client is None:
+            raise HTTPException(status_code=503, detail="Redis is not available")
+
+        key = visited_key(redirect_url)
+        already_visited = await redis_client.sismember(key, state)
+        if already_visited:
+            logging.info(f"User {state} already visited {redirect_url} — no callback will be scheduled.")
             return RedirectResponse(url=redirect_url)
 
-        # Якщо перший перехід
-        visited_states.add(state)
+        await redis_client.sadd(key, state)
+        ttl = await redis_client.ttl(key)
+        if ttl == -1:
+            await redis_client.expire(key, VISITED_TTL_SECONDS)
 
         background_tasks.add_task(
             schedule_callback,
