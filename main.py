@@ -25,8 +25,9 @@ VISITED_TTL_SECONDS = int(os.getenv("VISITED_TTL_SECONDS", str(30 * 24 * 60 * 60
 redis_client: Optional[Redis] = None
 
 
-def visited_key(redirect_url: str) -> str:
-    digest = hashlib.sha256(redirect_url.encode("utf-8")).hexdigest()
+def visited_key(base_url: str, redirect_url: str) -> str:
+    key_source = f"{base_url}|{redirect_url}"
+    digest = hashlib.sha256(key_source.encode("utf-8")).hexdigest()
     return f"visited:{digest}"
 
 
@@ -109,7 +110,12 @@ async def create_link(link_data: LinkRequest, request: Request):
 
 
 @app.get("/redirect/{token}")
-async def redirect(token: str, state: Optional[str] = None, background_tasks: BackgroundTasks = None):
+async def redirect(
+    token: str,
+    request: Request,
+    state: Optional[str] = None,
+    background_tasks: BackgroundTasks = None,
+):
     if state is None:
         raise HTTPException(status_code=400, detail="State is required")
 
@@ -126,7 +132,8 @@ async def redirect(token: str, state: Optional[str] = None, background_tasks: Ba
         if redis_client is None:
             raise HTTPException(status_code=503, detail="Redis is not available")
 
-        key = visited_key(redirect_url)
+        base_url = get_base_url(request)
+        key = visited_key(base_url, redirect_url)
         already_visited = await redis_client.sismember(key, state)
         if already_visited:
             logging.info(f"User {state} already visited {redirect_url} — no callback will be scheduled.")
