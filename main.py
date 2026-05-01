@@ -50,7 +50,7 @@ class LinkRequest(BaseModel):
 
     @validator('seconds')
     def validate_seconds(cls, v):
-        if v <= 0:
+        if v < 0:
             raise ValueError("Seconds must be positive")
         if v > 3600:
             raise ValueError("Maximum delay is 3600 seconds (1 hour)")
