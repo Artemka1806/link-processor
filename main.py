@@ -126,7 +126,7 @@ async def redirect(
         seconds = payload.get("seconds")
         redirect_url = payload.get("redirect_url")
 
-        if not all([callback_url, seconds, redirect_url]):
+        if callback_url is None or seconds is None or redirect_url is None:
             raise HTTPException(status_code=400, detail="Invalid link parameters")
 
         if redis_client is None:
